@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+mkdir -p "$ROOT/logs"
+
+MODEL="EleutherAI/gpt-neo-1.3B"
+STUDENT="EleutherAI/gpt-neo-125M"
+RUN_TAG=""
+TIME="auto"
+GPUS="auto"
+CPUS="8"
+MEM_PER_CORE="8G"
+ALLOW="auto"
+EMAIL="${EMAIL:-}"
+REUSE_DATASETS=""
+TEACHER_ONLY="0"
+ONLY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model) MODEL="$2"; shift 2;;
+    --student) STUDENT="$2"; shift 2;;
+    --run-tag) RUN_TAG="$2"; shift 2;;
+    --reuse-datasets) REUSE_DATASETS="$2"; shift 2;;
+    --teacher-only) TEACHER_ONLY="1"; shift 1;;
+    --only) ONLY="$2"; TEACHER_ONLY="1"; shift 2;;
+    --time) TIME="$2"; shift 2;;
+    --gpus) GPUS="$2"; shift 2;;
+    --cpus) CPUS="$2"; shift 2;;
+    --mem-per-core) MEM_PER_CORE="$2"; shift 2;;
+    --allow) ALLOW="$2"; shift 2;;
+    --email) EMAIL="$2"; shift 2;;
+    *) echo "Unknown arg: $1"; exit 1;;
+  esac
+ done
+
+if [[ -z "$RUN_TAG" ]]; then
+  RUN_TAG="$(echo "$MODEL" | sed 's#.*/##')"
+fi
+
+if [[ -n "$REUSE_DATASETS" ]]; then
+  ds_dir="$ROOT/data/datasets/$RUN_TAG"
+  if [[ ! -d "$ds_dir" ]]; then
+    echo "ERROR: --reuse-datasets set but dataset dir not found: $ds_dir" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$GPUS" == "auto" || "$TIME" == "auto" || "$ALLOW" == "auto" ]]; then
+  if [[ "$MODEL" == *"2.7B"* ]]; then
+    GPUS="${GPUS/auto/2}"
+    TIME="${TIME/auto/36:00:00}"
+    ALLOW="${ALLOW/auto/L}"
+  else
+    GPUS="${GPUS/auto/1}"
+    TIME="${TIME/auto/24:00:00}"
+    ALLOW="${ALLOW/auto/L}"
+  fi
+fi
+
+JOB_NAME="${RUN_TAG}_pipeline"
+if [[ "$TEACHER_ONLY" == "1" ]]; then
+  JOB_NAME="${RUN_TAG}_teachers"
+fi
+train_ddp_nproc="$GPUS"
+distill_ddp_nproc="$GPUS"
+unlearn_fsdp_nproc="$GPUS"
+extra_vars=""
+if [[ "$MODEL" == *"2.7B"* ]]; then
+  train_ddp_nproc="1"
+  distill_ddp_nproc="1"
+  extra_vars="PER_DEVICE_BATCH=1,GRAD_ACCUM=16,TRAIN_FSDP=1,TRAIN_FSDP_NPROC=$GPUS,TRAIN_FSDP_LAYER_CLS=GPTNeoBlock,TRAIN_GRAD_CHECKPOINTING=1,DISTILL_DDP_NPROC=1,DISTILL_TEACHER_DEVICE=cpu,DISTILL_GRAD_CHECKPOINTING=1"
+fi
+VARS="MODEL=$MODEL,STUDENT=$STUDENT,RUN_TAG=$RUN_TAG,STAGE=pipeline_full,TRAIN_DDP_NPROC=$train_ddp_nproc,DISTILL_DDP_NPROC=$distill_ddp_nproc,UNLEARN_FSDP_NPROC=$unlearn_fsdp_nproc,REPO_ROOT=$ROOT"
+if [[ "$MODEL" == *"2.7B"* ]]; then
+  VARS="$VARS,$extra_vars"
+fi
+if [[ -n "$REUSE_DATASETS" ]]; then
+  VARS="$VARS,REUSE_DATASETS=$REUSE_DATASETS"
+fi
+if [[ "$TEACHER_ONLY" == "1" ]]; then
+  VARS="$VARS,TEACHER_ONLY=1"
+fi
+if [[ -n "$ONLY" ]]; then
+  run_c1=0
+  run_c2=0
+  run_c3=0
+  IFS=',' read -r -a only_items <<< "$ONLY"
+  for item in "${only_items[@]}"; do
+    case "$item" in
+      c1) run_c1=1 ;;
+      c2) run_c2=1 ;;
+      c3) run_c3=1 ;;
+      *) echo "Unknown condition in --only: $item" >&2; exit 1 ;;
+    esac
+  done
+  VARS="$VARS,RUN_C1=$run_c1,RUN_C2=$run_c2,RUN_C3=$run_c3"
+  safe_only="$(echo "$ONLY" | tr ',' '_')"
+  JOB_NAME="${JOB_NAME}_${safe_only}"
+fi
+
+QSUB_ARGS=(
+  -N "$JOB_NAME"
+  -l "h_rt=$TIME"
+  -l "mem=$MEM_PER_CORE"
+  -l "gpu=$GPUS"
+  -pe smp "$CPUS"
+  -v "$VARS"
+)
+
+if [[ -n "$ALLOW" ]]; then
+  QSUB_ARGS+=( -ac "allow=$ALLOW" )
+fi
+if [[ -n "$EMAIL" ]]; then
+  QSUB_ARGS+=( -m bea -M "$EMAIL" )
+fi
+
+qsub "${QSUB_ARGS[@]}" "$ROOT/cluster/qsub_run.sh" | awk '{print $3}'
