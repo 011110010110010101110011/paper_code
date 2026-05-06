@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Edit these for your cluster environment.
+# Ensure the module function exists in non-interactive shells.
+if ! command -v module >/dev/null 2>&1; then
+  for init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /shared/ucl/apps/modules/5.3.1/init/bash; do
+    if [[ -f "$init" ]]; then
+      # shellcheck source=/dev/null
+      source "$init"
+      break
+    fi
+  done
+fi
+
+if command -v module >/dev/null 2>&1; then
+  module purge
+  if module -t avail ucl-stack/2025-12 2>&1 | grep -q "ucl-stack/2025-12"; then
+    module load ucl-stack/2025-12
+    module load default-modules/2025-12
+  else
+    module load default-modules/2018
+    py_mod="$(module -t avail python 2>&1 | sed 's#.*/##' | grep -E '^python/[0-9]+' | sort -V | tail -n 1 || true)"
+    if [[ -n "$py_mod" ]]; then
+      module load "$py_mod"
+    fi
+  fi
+
+  # Prefer an explicit python module if requested; otherwise pick a recent one.
+  if [[ -n "${PYTHON_MODULE:-}" ]]; then
+    module load "$PYTHON_MODULE"
+  else
+    for cand in python/3.11.4 python/3.11 python/3.10.4 python/3.10 python/3.9 python/3.8; do
+      if module -t avail "$cand" 2>&1 | grep -q "$cand"; then
+        module load "$cand"
+        export PYTHON_MODULE="$cand"
+        break
+      fi
+    done
+  fi
+fi
+
+# Example modules (adjust as needed)
+# module load cuda/12.1
+
+# Choose a python binary for setup if not provided.
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if command -v python3.11 >/dev/null 2>&1; then
+    export PYTHON_BIN="python3.11"
+  elif command -v python3 >/dev/null 2>&1; then
+    export PYTHON_BIN="python3"
+  elif command -v python >/dev/null 2>&1; then
+    export PYTHON_BIN="python"
+  fi
+fi
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
